@@ -1,0 +1,432 @@
+import cv2
+import numpy as np
+import time
+import threading
+
+# Global configurations & buffers
+LEFT_LANE_HISTORY = []
+RIGHT_LANE_HISTORY = []
+BUFFER_SIZE = 15
+ENDPOINT_HISTORY = []
+VANISHING_POINT_HISTORY = []
+STEERING_OUTPUT_HISTORY = []  # Smooths out steering telemetry jitter
+
+# Confidence Tracking Variables
+LEFT_CONFIDENCE_COOLDOWN = 0
+RIGHT_CONFIDENCE_COOLDOWN = 0
+MAX_HOLD_FRAMES = 10  # How many frames to trust last-known good data before resetting
+
+DYNAMIC_Y_BOTTOM = 0.68
+DYNAMIC_Y_TOP = 0.52
+
+class PIDController:
+    def __init__(self, kp, ki, kd):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.prev_error = 0
+        self.integral = 0
+        self.prev_time = time.time()
+
+    def update(self, current_error):
+        current_time = time.time()
+        dt = current_time - self.prev_time
+        if dt <= 0:
+            dt = 0.03
+        p_out = self.kp * current_error
+        self.integral += current_error * dt
+        self.integral = max(min(self.integral, 100), -100)
+        i_out = self.ki * self.integral
+        derivative = (current_error - self.prev_error) / dt
+        d_out = self.kd * derivative
+        self.prev_error = current_error
+        self.prev_time = current_time
+        return p_out + i_out + d_out
+
+# Smoothed PID tuning constants
+pid = PIDController(kp=0.025, ki=0.001, kd=0.015)
+
+def compute_dynamic_boundaries(frame_height):
+    global ENDPOINT_HISTORY, DYNAMIC_Y_TOP, DYNAMIC_Y_BOTTOM
+    if len(ENDPOINT_HISTORY) < 5:
+        return int(frame_height * DYNAMIC_Y_BOTTOM), int(frame_height * DYNAMIC_Y_TOP)
+        
+    test_heights = np.linspace(int(frame_height * 0.40), int(frame_height * 0.90), 20, dtype=int)
+    variances = []
+    
+    for y_test in test_heights:
+        x_intercepts = []
+        for lines in ENDPOINT_HISTORY:
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                if (x2 - x1) != 0:
+                    slope = (y2 - y1) / (x2 - x1)
+                    if abs(slope) > 0.2:
+                        intercept = y1 - slope * x1
+                        x_at_y = (y_test - intercept) / slope
+                        x_intercepts.append(x_at_y)
+                        
+        if len(x_intercepts) > 4:
+            variances.append((y_test, np.std(x_intercepts)))
+        else:
+            variances.append((y_test, 999.0))
+            
+    stable_rows = [y for y, variance in variances if variance < 35.0]
+    if stable_rows:
+        y_bottom_idx = max(stable_rows)
+        y_top_idx = min(stable_rows)
+        if (y_bottom_idx - y_top_idx) > (frame_height * 0.12):
+            DYNAMIC_Y_BOTTOM = 0.85 * DYNAMIC_Y_BOTTOM + 0.15 * (y_bottom_idx / frame_height)
+            DYNAMIC_Y_TOP = 0.85 * DYNAMIC_Y_TOP + 0.15 * (y_top_idx / frame_height)
+
+    return int(frame_height * DYNAMIC_Y_BOTTOM), int(frame_height * DYNAMIC_Y_TOP)
+
+def select_roi(frame, y_bottom, y_top):
+    height, width = frame.shape[:2]
+    polygons = np.array([
+        [
+            (int(width * 0.05), y_bottom),  
+            (int(width * 0.95), y_bottom),  
+            (int(width * 0.65), y_top),     
+            (int(width * 0.35), y_top)      
+        ]
+    ])
+    mask = np.zeros_like(frame)
+    cv2.fillPoly(mask, polygons, 255)
+    return cv2.bitwise_and(frame, mask)
+
+def detect_forward_vehicle(frame, edges, y_bottom, y_top):
+    height, width = edges.shape[:2]
+    zone_left = int(width * 0.35)
+    zone_right = int(width * 0.65)
+    danger_top = int(y_top + (y_bottom - y_top) * 0.3) 
+    danger_bottom = int(y_bottom - 10)
+    
+    proximity_bgr = frame[danger_top:danger_bottom, zone_left:zone_right]
+    proximity_edges = edges[danger_top:danger_bottom, zone_left:zone_right]
+    
+    if proximity_bgr.size == 0:
+        return False, (zone_left, danger_top, zone_right, danger_bottom)
+        
+    hsv = cv2.cvtColor(proximity_bgr, cv2.COLOR_BGR2HSV)
+    lower_red1 = np.array([0, 70, 50])
+    upper_red1 = np.array([10, 255, 255])
+    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    
+    lower_red2 = np.array([170, 70, 50])
+    upper_red2 = np.array([180, 255, 255])
+    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    
+    red_mask = cv2.bitwise_or(mask1, mask2)
+    red_structural_edges = cv2.bitwise_and(proximity_edges, proximity_edges, mask=red_mask)
+    
+    edge_pixel_count = cv2.countNonZero(red_structural_edges)
+    is_too_close = edge_pixel_count > 250 
+    return is_too_close, (zone_left, danger_top, zone_right, danger_bottom)
+
+def evaluate_line_confidence(candidate_fits):
+    if len(candidate_fits) < 3:  
+        return False
+        
+    slopes = [f[0] for f in candidate_fits]
+    slope_std = np.std(slopes)
+    
+    if slope_std > 0.35:
+        return False
+        
+    return True
+
+def draw_steering_wheel(img, angle_deg, center_pt=(540, 400), radius=45):
+    """
+    Renders an anti-aliased mathematical telemetry overlay of a steering wheel
+    rotated by the specified angle onto the output display frame.
+    """
+    angle_rad = np.radians(angle_deg)
+    
+    # Draw core outer chassis ring and center anchor hub
+    cv2.circle(img, center_pt, radius, (220, 220, 220), 3, lineType=cv2.LINE_AA)
+    cv2.circle(img, center_pt, int(radius * 0.2), (180, 180, 180), -1, lineType=cv2.LINE_AA)
+    
+    # Compute and project 3 matching structural wheel spokes
+    spoke_angles = [0, 120, 240]
+    for spoke_angle in spoke_angles:
+        total_rad = angle_rad + np.radians(spoke_angle)
+        x_end = int(center_pt[0] + radius * np.cos(total_rad))
+        y_end = int(center_pt[1] + radius * np.sin(total_rad))
+        cv2.line(img, center_pt, (x_end, y_end), (200, 200, 200), 2, lineType=cv2.LINE_AA)
+        
+    # Red tracking notch at the 12 o'clock center point
+    notch_rad = angle_rad - np.pi / 2
+    notch_x = int(center_pt[0] + radius * np.cos(notch_rad))
+    notch_y = int(center_pt[1] + radius * np.sin(notch_rad))
+    cv2.circle(img, (notch_x, notch_y), 4, (0, 0, 255), -1, lineType=cv2.LINE_AA)
+
+def process_frame(frame):
+    global ENDPOINT_HISTORY
+    height = frame.shape[0]
+    
+    y_bottom, y_top = compute_dynamic_boundaries(height)
+    
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 40, 130)
+    
+    vehicle_alarm, collision_box = detect_forward_vehicle(frame, edges, y_bottom, y_top)
+    
+    roi_edges = select_roi(edges, y_bottom, y_top)
+    raw_lines = cv2.HoughLinesP(roi_edges, 2, np.pi/180, 45, minLineLength=15, maxLineGap=90)
+    
+    filtered_lines = []
+    if raw_lines is not None:
+        for line in raw_lines:
+            x1, y1, x2, y2 = line[0]
+            if x2 - x1 == 0:
+                filtered_lines.append(line)
+                continue
+                
+            slope = (y2 - y1) / (x2 - x1)
+            if abs(slope) < 0.15 and max(y1, y2) > (y_top + (y_bottom - y_top) * 0.5):
+                continue
+                
+            filtered_lines.append(line)
+            
+        if len(filtered_lines) > 0:
+            filtered_lines = np.array(filtered_lines)
+            ENDPOINT_HISTORY.append(filtered_lines)
+            if len(ENDPOINT_HISTORY) > BUFFER_SIZE:
+                ENDPOINT_HISTORY.pop(0)
+        else:
+            filtered_lines = None
+    else:
+        filtered_lines = None
+            
+    return filtered_lines, roi_edges, y_bottom, y_top, vehicle_alarm, collision_box
+
+def display_lines(frame, lines, y_bottom, y_top, vehicle_alarm, collision_box):
+    global LEFT_LANE_HISTORY, RIGHT_LANE_HISTORY, VANISHING_POINT_HISTORY, pid
+    global LEFT_CONFIDENCE_COOLDOWN, RIGHT_CONFIDENCE_COOLDOWN, STEERING_OUTPUT_HISTORY
+    
+    line_image = np.zeros_like(frame)
+    height, width = frame.shape[:2]
+    
+    left_fit = []
+    right_fit = []
+    
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            if x2 - x1 == 0:
+                continue
+            slope = (y2 - y1) / (x2 - x1)
+            intercept = y1 - slope * x1
+            
+            if -2.5 < slope < -0.3:
+                right_fit.append((slope, intercept))
+            elif 0.3 < slope < 2.5:
+                left_fit.append((slope, intercept))
+                
+    # Evaluate confidence
+    left_has_confidence = evaluate_line_confidence(left_fit)
+    right_has_confidence = evaluate_line_confidence(right_fit)
+
+    if left_has_confidence:
+        LEFT_LANE_HISTORY.append(np.mean(left_fit, axis=0))
+        if len(LEFT_LANE_HISTORY) > BUFFER_SIZE: LEFT_LANE_HISTORY.pop(0)
+        LEFT_CONFIDENCE_COOLDOWN = 0  
+    else:
+        LEFT_CONFIDENCE_COOLDOWN += 1  
+
+    if right_has_confidence:
+        RIGHT_LANE_HISTORY.append(np.mean(right_fit, axis=0))
+        if len(RIGHT_LANE_HISTORY) > BUFFER_SIZE: RIGHT_LANE_HISTORY.pop(0)
+        RIGHT_CONFIDENCE_COOLDOWN = 0  
+    else:
+        RIGHT_CONFIDENCE_COOLDOWN += 1
+
+    left_base_x, left_top_x = None, None
+    right_base_x, right_top_x = None, None
+    smoothed_left, smoothed_right = None, None
+
+    if len(LEFT_LANE_HISTORY) > 0 and LEFT_CONFIDENCE_COOLDOWN < MAX_HOLD_FRAMES:
+        smoothed_left = np.mean(LEFT_LANE_HISTORY, axis=0)
+        left_base_x = int((y_bottom - smoothed_left[1]) / smoothed_left[0])
+        left_top_x = int((y_top - smoothed_left[1]) / smoothed_left[0])
+    elif LEFT_CONFIDENCE_COOLDOWN >= MAX_HOLD_FRAMES:
+        LEFT_LANE_HISTORY.clear()  
+
+    if len(RIGHT_LANE_HISTORY) > 0 and RIGHT_CONFIDENCE_COOLDOWN < MAX_HOLD_FRAMES:
+        smoothed_right = np.mean(RIGHT_LANE_HISTORY, axis=0)
+        right_base_x = int((y_bottom - smoothed_right[1]) / smoothed_right[0])
+        right_top_x = int((y_top - smoothed_right[1]) / smoothed_right[0])
+    elif RIGHT_CONFIDENCE_COOLDOWN >= MAX_HOLD_FRAMES:
+        RIGHT_LANE_HISTORY.clear()  
+
+    if left_base_x is not None and right_base_x is not None and left_top_x is not None and right_top_x is not None:
+        if -width < left_base_x < width * 2:
+            cv2.line(line_image, (left_base_x, y_bottom), (left_top_x, y_top), (0, 255, 0), 4)
+        if -width < right_base_x < width * 2:
+            cv2.line(line_image, (right_base_x, y_bottom), (right_top_x, y_top), (0, 255, 0), 4)
+        lane_poly_points = np.array([
+            [(left_base_x, y_bottom), (left_top_x, y_top), (right_top_x, y_top), (right_base_x, y_bottom)]
+        ], dtype=np.int32)
+        cv2.fillPoly(line_image, lane_poly_points, (140, 70, 0))
+
+    combined_image = cv2.addWeighted(frame, 0.8, line_image, 0.35, 1)
+    
+    x_start, y_start, x_end, y_end = collision_box
+    if vehicle_alarm:
+        cv2.rectangle(combined_image, (x_start, y_start), (x_end, y_end), (0, 0, 255), 3)
+    else:
+        cv2.rectangle(combined_image, (x_start, y_start), (x_end, y_end), (0, 255, 0), 1)
+    
+    car_center = int(width / 2) 
+    if smoothed_left is not None and smoothed_right is not None:
+        m1, b1 = smoothed_left
+        m2, b2 = smoothed_right
+        if (m1 - m2) != 0:
+            v_point_x = int((b2 - b1) / (m1 - m2))
+            VANISHING_POINT_HISTORY.append(v_point_x)
+            if len(VANISHING_POINT_HISTORY) > BUFFER_SIZE:
+                VANISHING_POINT_HISTORY.pop(0)
+                
+    if len(VANISHING_POINT_HISTORY) > 0:
+        car_center = int(np.mean(VANISHING_POINT_HISTORY))
+
+    flash_on = int(time.time() * 2) % 2 == 0
+
+    if left_base_x is not None and right_base_x is not None:
+        protected_left_x = left_base_x
+        protected_right_x = right_base_x
+        
+        if smoothed_left is not None:
+            slope_left = abs(smoothed_left[0])
+            if left_base_x > (width * 0.20):
+                left_scaler = max(1.0, (slope_left * 2.2))
+                left_buffer = int(45 * left_scaler)
+                protected_left_x = left_base_x + left_buffer
+                cv2.line(combined_image, (protected_left_x, y_bottom), (left_top_x, y_top), (255, 0, 255), 2)
+
+        if smoothed_right is not None:
+            slope_right = abs(smoothed_right[0])
+            if right_base_x < (width * 0.75):
+                right_scaler = max(1.0, (slope_right * 2.5))
+                right_buffer = int(50 * right_scaler)
+                protected_right_x = right_base_x - right_buffer
+                cv2.line(combined_image, (protected_right_x, y_bottom), (right_top_x, y_top), (255, 0, 255), 3)
+
+        lane_center = int((protected_left_x + protected_right_x) / 2)
+        pixel_error = lane_center - car_center
+        raw_steering_output = pid.update(pixel_error)
+        
+        # 3-Frame Moving Average Window Implementation
+        STEERING_OUTPUT_HISTORY.append(raw_steering_output)
+        if len(STEERING_OUTPUT_HISTORY) > 3:
+            STEERING_OUTPUT_HISTORY.pop(0)
+        steering_output = np.mean(STEERING_OUTPUT_HISTORY)
+        
+        if LEFT_CONFIDENCE_COOLDOWN > 0 or RIGHT_CONFIDENCE_COOLDOWN > 0:
+            text = f"HOLD ACTIVE (L: {LEFT_CONFIDENCE_COOLDOWN} R: {RIGHT_CONFIDENCE_COOLDOWN})"
+            color = (30, 165, 255)
+        elif steering_output > 1.0:
+            text = f"Steer -> RIGHT: {abs(steering_output):.2f}"
+            color = (0, 165, 255)
+        elif steering_output < -1.0:
+            text = f"Steer -> LEFT: {abs(steering_output):.2f}"
+            color = (0, 0, 255)
+        else:
+            text = "Tracking: CENTERED"
+            color = (0, 255, 0)
+            
+        cv2.putText(combined_image, text, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        cv2.circle(combined_image, (car_center, y_bottom - 20), 6, (255, 0, 0), -1) 
+        cv2.circle(combined_image, (lane_center, y_bottom - 20), 6, (0, 255, 255), -1)
+        
+        # Apply scaling and draw the dynamic steering asset
+        smoothed_display_angle = steering_output * 9.0
+        hud_center_x = int(width * 0.88)
+        hud_center_y = int(y_bottom + (height - y_bottom) * 0.5)
+        draw_steering_wheel(combined_image, smoothed_display_angle, center_pt=(hud_center_x, hud_center_y), radius=45)
+    else:
+        if flash_on:
+            cv2.rectangle(combined_image, (0, 0), (width, height), (0, 0, 255), 15)
+            cv2.putText(combined_image, "CRITICAL LOSS: NO ASSISTANCE AVAILABLE", (30, 50), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 3)
+        else:
+            cv2.putText(combined_image, "CRITICAL LOSS: NO ASSISTANCE AVAILABLE", (30, 50), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 60), 2)
+        
+    return combined_image
+
+
+class ThreadedVideoGet:
+    """
+    Class that continuously gets frames from a VideoCapture object
+    with a dedicated thread to drastically limit processing latency.
+    """
+    def __init__(self, src=0):
+        # FIX: Force the FFmpeg environment backend to route via TCP transport flags
+        import os
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+        
+        self.stream = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
+        (self.grabbed, self.frame) = self.stream.read()
+        self.stopped = False
+
+    def start(self):    
+        threading.Thread(target=self.get, args=(), daemon=True).start()
+        return self
+
+    def get(self):
+        while not self.stopped:
+            if not self.grabbed:
+                # If a temporary signal drop happens, try to re-grab instead of instantly breaking
+                time.sleep(0.01)
+                (self.grabbed, self.frame) = self.stream.read()
+            else:
+                (self.grabbed, self.frame) = self.stream.read()
+
+    def stop(self):
+        self.stopped = True
+        self.stream.release()
+
+
+def main():
+    # Setup live RTSP network stream link mapping configuration
+    stream_url = "rtsp://192.168.25.1:8080/live"
+    
+    print("Spawning threaded TCP capture worker...")
+    video_getter = ThreadedVideoGet(stream_url).start()
+    time.sleep(1.5)  # Give the connection handshake slightly longer to clear buffers
+
+    window_name = "Project Athena - Real-Time Pi Vision & Steering"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+    print("Pipeline running. Focus the UI window and press 'q' to stop.")
+
+    try:
+        while not video_getter.stopped:
+            frame = video_getter.frame
+            if frame is None:
+                continue
+
+            # Process thread-buffered frame through updated dynamic filter modules
+            lines, roi_edges, y_bottom, y_top, vehicle_alarm, collision_box = process_frame(frame)
+            output_frame = display_lines(frame, lines, y_bottom, y_top, vehicle_alarm, collision_box)
+
+            cv2.imshow(window_name, output_frame)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                video_getter.stop()
+                break
+                
+    except KeyboardInterrupt:
+        print("\nInterrupt received. Powering down pipeline...")
+        video_getter.stop()
+
+    # Safe release sequence
+    cv2.destroyAllWindows()
+    print("System teardown complete.")
+
+if __name__ == "__main__":
+    main()
