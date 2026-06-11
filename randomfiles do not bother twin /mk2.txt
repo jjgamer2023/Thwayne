@@ -1,3 +1,7 @@
+import os
+# Force the global FFMPEG backend to use UDP before any video utilities spin up
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp"
+
 import cv2
 import numpy as np
 import time
@@ -364,12 +368,10 @@ class ThreadedVideoGet:
     with a dedicated thread to drastically limit processing latency.
     """
     def __init__(self, src=0):
-        # Pass the transport argument as part of the RTSP target query parameters 
-        # instead of tweaking system environment maps that fail inside old backends.
-        if "rtsp://" in str(src) and "?" not in str(src):
-            src = f"{src}?rtsp_transport=tcp"
-            
+        # Initializing video capture context natively as done in your working snippet
         self.stream = cv2.VideoCapture(src)
+        self.stream.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.stream.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         (self.grabbed, self.frame) = self.stream.read()
         self.stopped = False
 
@@ -393,9 +395,9 @@ class ThreadedVideoGet:
 def main():
     stream_url = "rtsp://192.168.25.1:8080/live"
     
-    print("Spawning threaded TCP capture worker...")
+    print("Spawning threaded UDP capture worker...")
     video_getter = ThreadedVideoGet(stream_url).start()
-    time.sleep(2.0)  # Give the stream pipe ample buffer space to open cleanly
+    time.sleep(1.0)  
 
     window_name = "Project Athena - Real-Time Pi Vision & Steering"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -409,6 +411,7 @@ def main():
             if frame is None:
                 continue
 
+            # Process through the main tracking environment pipeline
             lines, roi_edges, y_bottom, y_top, vehicle_alarm, collision_box = process_frame(frame)
             output_frame = display_lines(frame, lines, y_bottom, y_top, vehicle_alarm, collision_box)
 
