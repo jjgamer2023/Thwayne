@@ -1,5 +1,5 @@
 import os
-# Force the global FFMPEG backend to use UDP before any video utilities spin up
+# FORCE UDP transport layer properties globally before importing cv2 modules
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp"
 
 import cv2
@@ -167,8 +167,12 @@ def draw_steering_wheel(img, angle_deg, center_pt=(540, 400), radius=45):
 
 def process_frame(frame):
     global ENDPOINT_HISTORY
-    height = frame.shape[0]
     
+    # Ensure raw incoming wide dimensions are standardized to our 640x480 grid layout
+    if frame.shape[1] > 640:
+        frame = cv2.resize(frame, (640, 480))
+        
+    height = frame.shape[0]
     y_bottom, y_top = compute_dynamic_boundaries(height)
     
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -210,6 +214,9 @@ def display_lines(frame, lines, y_bottom, y_top, vehicle_alarm, collision_box):
     global LEFT_LANE_HISTORY, RIGHT_LANE_HISTORY, VANISHING_POINT_HISTORY, pid
     global LEFT_CONFIDENCE_COOLDOWN, RIGHT_CONFIDENCE_COOLDOWN, STEERING_OUTPUT_HISTORY
     
+    if frame.shape[1] > 640:
+        frame = cv2.resize(frame, (640, 480))
+        
     line_image = np.zeros_like(frame)
     height, width = frame.shape[:2]
     
@@ -347,8 +354,8 @@ def display_lines(frame, lines, y_bottom, y_top, vehicle_alarm, collision_box):
         
         # Apply scaling and draw the dynamic steering asset
         smoothed_display_angle = steering_output * 9.0
-        hud_center_x = int(width * 0.88)
-        hud_center_y = int(y_bottom + (height - y_bottom) * 0.5)
+        hud_center_x = int(width * 0.85)
+        hud_center_y = int(y_bottom + (height - y_bottom) * 0.4)
         draw_steering_wheel(combined_image, smoothed_display_angle, center_pt=(hud_center_x, hud_center_y), radius=45)
     else:
         if flash_on:
@@ -368,7 +375,7 @@ class ThreadedVideoGet:
     with a dedicated thread to drastically limit processing latency.
     """
     def __init__(self, src=0):
-        # Initializing video capture context natively as done in your working snippet
+        # Initializing capturing backend following your precise resolution properties
         self.stream = cv2.VideoCapture(src)
         self.stream.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.stream.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -397,7 +404,7 @@ def main():
     
     print("Spawning threaded UDP capture worker...")
     video_getter = ThreadedVideoGet(stream_url).start()
-    time.sleep(1.0)  
+    time.sleep(1.0)  # Safe sync buffer allocation space
 
     window_name = "Project Athena - Real-Time Pi Vision & Steering"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -411,7 +418,6 @@ def main():
             if frame is None:
                 continue
 
-            # Process through the main tracking environment pipeline
             lines, roi_edges, y_bottom, y_top, vehicle_alarm, collision_box = process_frame(frame)
             output_frame = display_lines(frame, lines, y_bottom, y_top, vehicle_alarm, collision_box)
 
