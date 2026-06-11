@@ -364,11 +364,12 @@ class ThreadedVideoGet:
     with a dedicated thread to drastically limit processing latency.
     """
     def __init__(self, src=0):
-        # FIX: Force the FFmpeg environment backend to route via TCP transport flags
-        import os
-        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
-        
-        self.stream = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
+        # Pass the transport argument as part of the RTSP target query parameters 
+        # instead of tweaking system environment maps that fail inside old backends.
+        if "rtsp://" in str(src) and "?" not in str(src):
+            src = f"{src}?rtsp_transport=tcp"
+            
+        self.stream = cv2.VideoCapture(src)
         (self.grabbed, self.frame) = self.stream.read()
         self.stopped = False
 
@@ -379,7 +380,6 @@ class ThreadedVideoGet:
     def get(self):
         while not self.stopped:
             if not self.grabbed:
-                # If a temporary signal drop happens, try to re-grab instead of instantly breaking
                 time.sleep(0.01)
                 (self.grabbed, self.frame) = self.stream.read()
             else:
@@ -391,12 +391,11 @@ class ThreadedVideoGet:
 
 
 def main():
-    # Setup live RTSP network stream link mapping configuration
     stream_url = "rtsp://192.168.25.1:8080/live"
     
     print("Spawning threaded TCP capture worker...")
     video_getter = ThreadedVideoGet(stream_url).start()
-    time.sleep(1.5)  # Give the connection handshake slightly longer to clear buffers
+    time.sleep(2.0)  # Give the stream pipe ample buffer space to open cleanly
 
     window_name = "Project Athena - Real-Time Pi Vision & Steering"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -410,7 +409,6 @@ def main():
             if frame is None:
                 continue
 
-            # Process thread-buffered frame through updated dynamic filter modules
             lines, roi_edges, y_bottom, y_top, vehicle_alarm, collision_box = process_frame(frame)
             output_frame = display_lines(frame, lines, y_bottom, y_top, vehicle_alarm, collision_box)
 
@@ -424,7 +422,6 @@ def main():
         print("\nInterrupt received. Powering down pipeline...")
         video_getter.stop()
 
-    # Safe release sequence
     cv2.destroyAllWindows()
     print("System teardown complete.")
 
